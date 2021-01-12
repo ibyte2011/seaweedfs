@@ -2,7 +2,6 @@ package command
 
 import (
 	"bufio"
-	"context"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/operation"
@@ -33,19 +34,22 @@ type BenchmarkOptions struct {
 	read             *bool
 	sequentialRead   *bool
 	collection       *string
+	replication      *string
 	cpuprofile       *string
 	maxCpu           *int
-	secretKey        *string
+	grpcDialOption   grpc.DialOption
+	masterClient     *wdclient.MasterClient
+	fsync            *bool
 }
 
 var (
-	b            BenchmarkOptions
-	sharedBytes  []byte
-	masterClient *wdclient.MasterClient
+	b           BenchmarkOptions
+	sharedBytes []byte
+	isSecure    bool
 )
 
 func init() {
-	cmdBenchmark.Run = runbenchmark // break init cycle
+	cmdBenchmark.Run = runBenchmark // break init cycle
 	cmdBenchmark.IsDebug = cmdBenchmark.Flag.Bool("debug", false, "verbose debug information")
 	b.masters = cmdBenchmark.Flag.String("master", "localhost:9333", "SeaweedFS master location")
 	b.concurrency = cmdBenchmark.Flag.Int("c", 16, "number of concurrent write or read processes")
@@ -57,14 +61,15 @@ func init() {
 	b.read = cmdBenchmark.Flag.Bool("read", true, "enable read")
 	b.sequentialRead = cmdBenchmark.Flag.Bool("readSequentially", false, "randomly read by ids from \"-list\" specified file")
 	b.collection = cmdBenchmark.Flag.String("collection", "benchmark", "write data to this collection")
+	b.replication = cmdBenchmark.Flag.String("replication", "000", "replication type")
 	b.cpuprofile = cmdBenchmark.Flag.String("cpuprofile", "", "cpu profile output file")
 	b.maxCpu = cmdBenchmark.Flag.Int("maxCpu", 0, "maximum number of CPUs. 0 means all available CPUs")
-	b.secretKey = cmdBenchmark.Flag.String("secure.secret", "", "secret to encrypt Json Web Token(JWT)")
+	b.fsync = cmdBenchmark.Flag.Bool("fsync", false, "flush data to disk after write")
 	sharedBytes = make([]byte, 1024)
 }
 
 var cmdBenchmark = &Command{
-	UsageLine: "benchmark -server=localhost:9333 -c=10 -n=100000",
+	UsageLine: "benchmark -master=localhost:9333 -c=10 -n=100000",
 	Short:     "benchmark on writing millions of files and read out",
 	Long: `benchmark on an empty SeaweedFS file system.
 
@@ -101,8 +106,12 @@ var (
 	readStats  *stats
 )
 
-func runbenchmark(cmd *Command, args []string) bool {
-	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.VERSION, runtime.GOOS, runtime.GOARCH)
+func runBenchmark(cmd *Command, args []string) bool {
+
+	util.LoadConfiguration("security", false)
+	b.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
+
+	fmt.Printf("This is SeaweedFS version %s %s %s\n", util.Version(), runtime.GOOS, runtime.GOARCH)
 	if *b.maxCpu < 1 {
 		*b.maxCpu = runtime.NumCPU()
 	}
@@ -116,22 +125,22 @@ func runbenchmark(cmd *Command, args []string) bool {
 		defer pprof.StopCPUProfile()
 	}
 
-	masterClient = wdclient.NewMasterClient(context.Background(), "benchmark", strings.Split(*b.masters, ","))
-	go masterClient.KeepConnectedToMaster()
-	masterClient.WaitUntilConnected()
+	b.masterClient = wdclient.NewMasterClient(b.grpcDialOption, "client", "", 0, "", strings.Split(*b.masters, ","))
+	go b.masterClient.KeepConnectedToMaster()
+	b.masterClient.WaitUntilConnected()
 
 	if *b.write {
-		bench_write()
+		benchWrite()
 	}
 
 	if *b.read {
-		bench_read()
+		benchRead()
 	}
 
 	return true
 }
 
-func bench_write() {
+func benchWrite() {
 	fileIdLineChan := make(chan string)
 	finishChan := make(chan bool)
 	writeStats = newStats(*b.concurrency)
@@ -158,7 +167,7 @@ func bench_write() {
 	writeStats.printStats()
 }
 
-func bench_read() {
+func benchRead() {
 	fileIdLineChan := make(chan string)
 	finishChan := make(chan bool)
 	readStats = newStats(*b.concurrency)
@@ -188,7 +197,6 @@ func writeFiles(idChan chan int, fileIdLineChan chan string, s *stat) {
 	defer wait.Done()
 	delayedDeleteChan := make(chan *delayedFile, 100)
 	var waitForDeletions sync.WaitGroup
-	secret := security.Secret(*b.secretKey)
 
 	for i := 0; i < 7; i++ {
 		waitForDeletions.Add(1)
@@ -198,8 +206,11 @@ func writeFiles(idChan chan int, fileIdLineChan chan string, s *stat) {
 				if df.enterTime.After(time.Now()) {
 					time.Sleep(df.enterTime.Sub(time.Now()))
 				}
-				if e := util.Delete("http://"+df.fp.Server+"/"+df.fp.Fid,
-					security.GenJwt(secret, df.fp.Fid)); e == nil {
+				var jwtAuthorization security.EncodedJwt
+				if isSecure {
+					jwtAuthorization = operation.LookupJwt(b.masterClient.GetMaster(), df.fp.Fid)
+				}
+				if e := util.Delete(fmt.Sprintf("http://%s/%s", df.fp.Server, df.fp.Fid), string(jwtAuthorization)); e == nil {
 					s.completed++
 				} else {
 					s.failed++
@@ -213,14 +224,23 @@ func writeFiles(idChan chan int, fileIdLineChan chan string, s *stat) {
 	for id := range idChan {
 		start := time.Now()
 		fileSize := int64(*b.fileSize + random.Intn(64))
-		fp := &operation.FilePart{Reader: &FakeReader{id: uint64(id), size: fileSize}, FileSize: fileSize}
-		ar := &operation.VolumeAssignRequest{
-			Count:      1,
-			Collection: *b.collection,
+		fp := &operation.FilePart{
+			Reader:   &FakeReader{id: uint64(id), size: fileSize, random: random},
+			FileSize: fileSize,
+			MimeType: "image/bench", // prevent gzip benchmark content
+			Fsync:    *b.fsync,
 		}
-		if assignResult, err := operation.Assign(masterClient.GetMaster(), ar); err == nil {
+		ar := &operation.VolumeAssignRequest{
+			Count:       1,
+			Collection:  *b.collection,
+			Replication: *b.replication,
+		}
+		if assignResult, err := operation.Assign(b.masterClient.GetMaster(), b.grpcDialOption, ar); err == nil {
 			fp.Server, fp.Fid, fp.Collection = assignResult.Url, assignResult.Fid, *b.collection
-			if _, err := fp.Upload(0, masterClient.GetMaster(), secret); err == nil {
+			if !isSecure && assignResult.Auth != "" {
+				isSecure = true
+			}
+			if _, err := fp.Upload(0, b.masterClient.GetMaster(), false, assignResult.Auth, b.grpcDialOption); err == nil {
 				if random.Intn(100) < *b.deletePercentage {
 					s.total++
 					delayedDeleteChan <- &delayedFile{time.Now().Add(time.Second), fp}
@@ -260,19 +280,29 @@ func readFiles(fileIdLineChan chan string, s *stat) {
 			fmt.Printf("reading file %s\n", fid)
 		}
 		start := time.Now()
-		url, err := masterClient.LookupFileId(fid)
+		var bytesRead int
+		var err error
+		urls, err := b.masterClient.LookupFileId(fid)
 		if err != nil {
 			s.failed++
 			println("!!!! ", fid, " location not found!!!!!")
 			continue
 		}
-		if bytesRead, err := util.Get(url); err == nil {
+		var bytes []byte
+		for _, url := range urls {
+			bytes, _, err = util.Get(url)
+			if err == nil {
+				break
+			}
+		}
+		bytesRead = len(bytes)
+		if err == nil {
 			s.completed++
-			s.transferred += int64(len(bytesRead))
+			s.transferred += int64(bytesRead)
 			readStats.addSample(time.Now().Sub(start))
 		} else {
 			s.failed++
-			fmt.Printf("Failed to read %s error:%v\n", url, err)
+			fmt.Printf("Failed to read %s error:%v\n", fid, err)
 		}
 	}
 }
@@ -334,7 +364,7 @@ func readFileIds(fileName string, fileIdLineChan chan string) {
 }
 
 const (
-	benchResolution = 10000 //0.1 microsecond
+	benchResolution = 10000 // 0.1 microsecond
 	benchBucket     = 1000000000 / benchResolution
 )
 
@@ -457,7 +487,7 @@ func (s *stats) printStats() {
 	fmt.Printf("\nConnection Times (ms)\n")
 	fmt.Printf("              min      avg        max      std\n")
 	fmt.Printf("Total:        %2.1f      %3.1f       %3.1f      %3.1f\n", float32(min)/10, float32(avg)/10, float32(max)/10, std/10)
-	//printing percentiles
+	// printing percentiles
 	fmt.Printf("\nPercentage of the requests served within a certain time (ms)\n")
 	percentiles := make([]int, len(percentages))
 	for i := 0; i < len(percentages); i++ {
@@ -491,8 +521,9 @@ func (s *stats) printStats() {
 
 // a fake reader to generate content to upload
 type FakeReader struct {
-	id   uint64 // an id number
-	size int64  // max bytes
+	id     uint64 // an id number
+	size   int64  // max bytes
+	random *rand.Rand
 }
 
 func (l *FakeReader) Read(p []byte) (n int, err error) {
@@ -508,6 +539,7 @@ func (l *FakeReader) Read(p []byte) (n int, err error) {
 		for i := 0; i < 8; i++ {
 			p[i] = byte(l.id >> uint(i*8))
 		}
+		l.random.Read(p[8:])
 	}
 	l.size -= int64(n)
 	return

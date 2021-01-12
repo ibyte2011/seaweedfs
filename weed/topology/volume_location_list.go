@@ -2,6 +2,8 @@ package topology
 
 import (
 	"fmt"
+
+	"github.com/chrislusf/seaweedfs/weed/storage/needle"
 )
 
 type VolumeLocationList struct {
@@ -16,12 +18,23 @@ func (dnll *VolumeLocationList) String() string {
 	return fmt.Sprintf("%v", dnll.list)
 }
 
+func (dnll *VolumeLocationList) Copy() *VolumeLocationList {
+	list := make([]*DataNode, len(dnll.list))
+	copy(list, dnll.list)
+	return &VolumeLocationList{
+		list: list,
+	}
+}
+
 func (dnll *VolumeLocationList) Head() *DataNode {
 	//mark first node as master volume
 	return dnll.list[0]
 }
 
 func (dnll *VolumeLocationList) Length() int {
+	if dnll == nil {
+		return 0
+	}
 	return len(dnll.list)
 }
 
@@ -62,4 +75,16 @@ func (dnll *VolumeLocationList) Refresh(freshThreshHold int64) {
 		}
 		dnll.list = l
 	}
+}
+
+func (dnll *VolumeLocationList) Stats(vid needle.VolumeId, freshThreshHold int64) (size uint64, fileCount int) {
+	for _, dnl := range dnll.list {
+		if dnl.LastSeen < freshThreshHold {
+			vinfo, err := dnl.GetVolumesById(vid)
+			if err == nil {
+				return vinfo.Size - vinfo.DeletedByteCount, vinfo.FileCount - vinfo.DeleteCount
+			}
+		}
+	}
+	return 0, 0
 }

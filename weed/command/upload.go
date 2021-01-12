@@ -1,13 +1,18 @@
 package command
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/chrislusf/seaweedfs/weed/pb"
+	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
+	"google.golang.org/grpc"
 	"os"
 	"path/filepath"
 
 	"github.com/chrislusf/seaweedfs/weed/operation"
 	"github.com/chrislusf/seaweedfs/weed/security"
+	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 var (
@@ -15,15 +20,15 @@ var (
 )
 
 type UploadOptions struct {
-	master      *string
-	dir         *string
-	include     *string
-	replication *string
-	collection  *string
-	dataCenter  *string
-	ttl         *string
-	maxMB       *int
-	secretKey   *string
+	master       *string
+	dir          *string
+	include      *string
+	replication  *string
+	collection   *string
+	dataCenter   *string
+	ttl          *string
+	maxMB        *int
+	usePublicUrl *bool
 }
 
 func init() {
@@ -36,8 +41,8 @@ func init() {
 	upload.collection = cmdUpload.Flag.String("collection", "", "optional collection name")
 	upload.dataCenter = cmdUpload.Flag.String("dataCenter", "", "optional data center name")
 	upload.ttl = cmdUpload.Flag.String("ttl", "", "time to live, e.g.: 1m, 1h, 1d, 1M, 1y")
-	upload.maxMB = cmdUpload.Flag.Int("maxMB", 0, "split files larger than the limit")
-	upload.secretKey = cmdUpload.Flag.String("secure.secret", "", "secret to encrypt Json Web Token(JWT)")
+	upload.maxMB = cmdUpload.Flag.Int("maxMB", 32, "split files larger than the limit")
+	upload.usePublicUrl = cmdUpload.Flag.Bool("usePublicUrl", false, "upload to public url from volume server")
 }
 
 var cmdUpload = &Command{
@@ -53,23 +58,31 @@ var cmdUpload = &Command{
   All files under the folder and subfolders will be uploaded, each with its own file key.
   Optional parameter "-include" allows you to specify the file name patterns.
 
-  If any file has a ".gz" extension, the content are considered gzipped already, and will be stored as is.
-  This can save volume server's gzipped processing and allow customizable gzip compression level.
-  The file name will strip out ".gz" and stored. For example, "jquery.js.gz" will be stored as "jquery.js".
-
-  If "maxMB" is set to a positive number, files larger than it would be split into chunks and uploaded separatedly.
+  If "maxMB" is set to a positive number, files larger than it would be split into chunks and uploaded separately.
   The list of file ids of those chunks would be stored in an additional chunk, and this additional chunk's file id would be returned.
 
   `,
 }
 
 func runUpload(cmd *Command, args []string) bool {
-	secret := security.Secret(*upload.secretKey)
+
+	util.LoadConfiguration("security", false)
+	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
+
+	defaultCollection, err := readMasterConfiguration(grpcDialOption, *upload.master)
+	if err != nil {
+		fmt.Printf("upload: %v", err)
+		return false
+	}
+	if *upload.replication == "" {
+		*upload.replication = defaultCollection
+	}
+
 	if len(args) == 0 {
 		if *upload.dir == "" {
 			return false
 		}
-		filepath.Walk(*upload.dir, func(path string, info os.FileInfo, err error) error {
+		filepath.Walk(util.ResolvePath(*upload.dir), func(path string, info os.FileInfo, err error) error {
 			if err == nil {
 				if !info.IsDir() {
 					if *upload.include != "" {
@@ -81,9 +94,7 @@ func runUpload(cmd *Command, args []string) bool {
 					if e != nil {
 						return e
 					}
-					results, e := operation.SubmitFiles(*upload.master, parts,
-						*upload.replication, *upload.collection, *upload.dataCenter,
-						*upload.ttl, *upload.maxMB, secret)
+					results, e := operation.SubmitFiles(*upload.master, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.maxMB, *upload.usePublicUrl)
 					bytes, _ := json.Marshal(results)
 					fmt.Println(string(bytes))
 					if e != nil {
@@ -100,11 +111,21 @@ func runUpload(cmd *Command, args []string) bool {
 		if e != nil {
 			fmt.Println(e.Error())
 		}
-		results, _ := operation.SubmitFiles(*upload.master, parts,
-			*upload.replication, *upload.collection, *upload.dataCenter,
-			*upload.ttl, *upload.maxMB, secret)
+		results, _ := operation.SubmitFiles(*upload.master, grpcDialOption, parts, *upload.replication, *upload.collection, *upload.dataCenter, *upload.ttl, *upload.maxMB, *upload.usePublicUrl)
 		bytes, _ := json.Marshal(results)
 		fmt.Println(string(bytes))
 	}
 	return true
+}
+
+func readMasterConfiguration(grpcDialOption grpc.DialOption, masterAddress string) (replication string, err error) {
+	err = pb.WithMasterClient(masterAddress, grpcDialOption, func(client master_pb.SeaweedClient) error {
+		resp, err := client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
+		if err != nil {
+			return fmt.Errorf("get master %s configuration: %v", masterAddress, err)
+		}
+		replication = resp.DefaultReplication
+		return nil
+	})
+	return
 }

@@ -5,12 +5,17 @@ import (
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
+	"github.com/chrislusf/seaweedfs/weed/s3api/s3err"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
+
+	"google.golang.org/grpc"
+
+	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/pb"
+	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 )
 
 type mimeType string
@@ -35,34 +40,35 @@ func encodeResponse(response interface{}) []byte {
 	return bytesBuffer.Bytes()
 }
 
-func (s3a *S3ApiServer) withFilerClient(fn func(filer_pb.SeaweedFilerClient) error) error {
+var _ = filer_pb.FilerClient(&S3ApiServer{})
 
-	grpcConnection, err := util.GrpcDial(s3a.option.FilerGrpcAddress)
-	if err != nil {
-		return fmt.Errorf("fail to dial %s: %v", s3a.option.FilerGrpcAddress, err)
-	}
-	defer grpcConnection.Close()
+func (s3a *S3ApiServer) WithFilerClient(fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+	return pb.WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+		return fn(client)
+	}, s3a.option.FilerGrpcAddress, s3a.option.GrpcDialOption)
 
-	return fn(client)
+}
+func (s3a *S3ApiServer) AdjustedUrl(location *filer_pb.Location) string {
+	return location.Url
 }
 
 // If none of the http routes match respond with MethodNotAllowed
 func notFoundHandler(w http.ResponseWriter, r *http.Request) {
 	glog.V(0).Infof("unsupported %s %s", r.Method, r.RequestURI)
-	writeErrorResponse(w, ErrMethodNotAllowed, r.URL)
+	writeErrorResponse(w, s3err.ErrMethodNotAllowed, r.URL)
 }
 
-func writeErrorResponse(w http.ResponseWriter, errorCode ErrorCode, reqURL *url.URL) {
-	apiError := getAPIError(errorCode)
+func writeErrorResponse(w http.ResponseWriter, errorCode s3err.ErrorCode, reqURL *url.URL) {
+	apiError := s3err.GetAPIError(errorCode)
 	errorResponse := getRESTErrorResponse(apiError, reqURL.Path)
 	encodedErrorResponse := encodeResponse(errorResponse)
 	writeResponse(w, apiError.HTTPStatusCode, encodedErrorResponse, mimeXML)
 }
 
-func getRESTErrorResponse(err APIError, resource string) RESTErrorResponse {
-	return RESTErrorResponse{
+func getRESTErrorResponse(err s3err.APIError, resource string) s3err.RESTErrorResponse {
+	return s3err.RESTErrorResponse{
 		Code:      err.Code,
 		Message:   err.Description,
 		Resource:  resource,
@@ -72,12 +78,19 @@ func getRESTErrorResponse(err APIError, resource string) RESTErrorResponse {
 
 func writeResponse(w http.ResponseWriter, statusCode int, response []byte, mType mimeType) {
 	setCommonHeaders(w)
+	if response != nil {
+		w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+	}
 	if mType != mimeNone {
 		w.Header().Set("Content-Type", string(mType))
 	}
 	w.WriteHeader(statusCode)
 	if response != nil {
-		w.Write(response)
+		glog.V(4).Infof("status %d %s: %s", statusCode, mType, string(response))
+		_, err := w.Write(response)
+		if err != nil {
+			glog.V(0).Infof("write err: %v", err)
+		}
 		w.(http.Flusher).Flush()
 	}
 }

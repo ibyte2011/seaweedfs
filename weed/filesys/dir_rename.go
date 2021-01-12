@@ -1,102 +1,82 @@
 package filesys
 
 import (
-	"bazil.org/fuse"
-	"bazil.org/fuse/fs"
 	"context"
+
+	"github.com/seaweedfs/fuse"
+	"github.com/seaweedfs/fuse/fs"
+
 	"github.com/chrislusf/seaweedfs/weed/glog"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"path/filepath"
+	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
 func (dir *Dir) Rename(ctx context.Context, req *fuse.RenameRequest, newDirectory fs.Node) error {
 
 	newDir := newDirectory.(*Dir)
 
-	return dir.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	newPath := util.NewFullPath(newDir.FullPath(), req.NewName)
+	oldPath := util.NewFullPath(dir.FullPath(), req.OldName)
 
-		// find existing entry
-		request := &filer_pb.LookupDirectoryEntryRequest{
-			Directory: dir.Path,
-			Name:      req.OldName,
+	glog.V(4).Infof("dir Rename %s => %s", oldPath, newPath)
+
+	// find local old entry
+	oldEntry, err := dir.wfs.metaCache.FindEntry(context.Background(), oldPath)
+	if err != nil {
+		glog.Errorf("dir Rename can not find source %s : %v", oldPath, err)
+		return fuse.ENOENT
+	}
+
+	// update remote filer
+	err = dir.wfs.WithFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		request := &filer_pb.AtomicRenameEntryRequest{
+			OldDirectory: dir.FullPath(),
+			OldName:      req.OldName,
+			NewDirectory: newDir.FullPath(),
+			NewName:      req.NewName,
 		}
 
-		glog.V(4).Infof("find existing directory entry: %v", request)
-		resp, err := client.LookupDirectoryEntry(ctx, request)
+		_, err := client.AtomicRenameEntry(ctx, request)
 		if err != nil {
-			glog.V(0).Infof("renaming find %s/%s: %v", dir.Path, req.OldName, err)
-			return fuse.ENOENT
+			glog.Errorf("dir AtomicRenameEntry %s => %s : %v", oldPath, newPath, err)
+			return fuse.EXDEV
 		}
 
-		entry := resp.Entry
+		return nil
 
-		glog.V(4).Infof("found existing directory entry resp: %+v", resp)
-
-		return moveEntry(ctx, client, dir.Path, entry, newDir.Path, req.NewName)
 	})
-
-}
-
-func moveEntry(ctx context.Context, client filer_pb.SeaweedFilerClient, oldParent string, entry *filer_pb.Entry, newParent, newName string) error {
-	if entry.IsDirectory {
-		currentDirPath := filepath.Join(oldParent, entry.Name)
-		request := &filer_pb.ListEntriesRequest{
-			Directory: currentDirPath,
-		}
-
-		glog.V(4).Infof("read directory: %v", request)
-		resp, err := client.ListEntries(ctx, request)
-		if err != nil {
-			glog.V(0).Infof("list %s: %v", oldParent, err)
-			return fuse.EIO
-		}
-
-		for _, item := range resp.Entries {
-			err := moveEntry(ctx, client, currentDirPath, item, filepath.Join(newParent, newName), item.Name)
-			if err != nil {
-				return err
-			}
-		}
-
+	if err != nil {
+		glog.V(0).Infof("dir Rename %s => %s : %v", oldPath, newPath, err)
+		return fuse.EIO
 	}
 
-	// add to new directory
-	{
-		request := &filer_pb.CreateEntryRequest{
-			Directory: newParent,
-			Entry: &filer_pb.Entry{
-				Name:        newName,
-				IsDirectory: entry.IsDirectory,
-				Attributes:  entry.Attributes,
-				Chunks:      entry.Chunks,
-			},
-		}
-
-		glog.V(1).Infof("create new entry: %v", request)
-		if _, err := client.CreateEntry(ctx, request); err != nil {
-			glog.V(0).Infof("renaming create %s/%s: %v", newParent, newName, err)
-			return fuse.EIO
-		}
+	// TODO: replicate renaming logic on filer
+	if err := dir.wfs.metaCache.DeleteEntry(context.Background(), oldPath); err != nil {
+		glog.V(0).Infof("dir Rename delete local %s => %s : %v", oldPath, newPath, err)
+		return fuse.EIO
+	}
+	oldEntry.FullPath = newPath
+	if err := dir.wfs.metaCache.InsertEntry(context.Background(), oldEntry); err != nil {
+		glog.V(0).Infof("dir Rename insert local %s => %s : %v", oldPath, newPath, err)
+		return fuse.EIO
 	}
 
-	// delete old entry
-	{
-		request := &filer_pb.DeleteEntryRequest{
-			Directory:    oldParent,
-			Name:         entry.Name,
-			IsDirectory:  entry.IsDirectory,
-			IsDeleteData: false,
-		}
+	// fmt.Printf("rename path: %v => %v\n", oldPath, newPath)
+	dir.wfs.fsNodeCache.Move(oldPath, newPath)
 
-		glog.V(1).Infof("remove old entry: %v", request)
-		_, err := client.DeleteEntry(ctx, request)
-		if err != nil {
-			glog.V(0).Infof("renaming delete %s/%s: %v", oldParent, entry.Name, err)
-			return fuse.EIO
-		}
-
+	// change file handle
+	dir.wfs.handlesLock.Lock()
+	defer dir.wfs.handlesLock.Unlock()
+	inodeId := oldPath.AsInode()
+	existingHandle, found := dir.wfs.handles[inodeId]
+	if !found || existingHandle == nil {
+		return err
 	}
+	delete(dir.wfs.handles, inodeId)
+	dir.wfs.handles[newPath.AsInode()] = existingHandle
 
-	return nil
-
+	return err
 }

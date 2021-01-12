@@ -2,194 +2,132 @@ package filesys
 
 import (
 	"bytes"
-	"context"
-	"fmt"
+	"io"
+	"runtime"
+	"sync"
 	"time"
 
 	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
 	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	"sync"
 )
 
 type ContinuousDirtyPages struct {
-	hasData bool
-	Offset  int64
-	Size    int64
-	Data    []byte
-	f       *File
-	lock    sync.Mutex
+	intervals              *ContinuousIntervals
+	f                      *File
+	writeWaitGroup         sync.WaitGroup
+	chunkAddLock           sync.Mutex
+	chunkSaveErrChan       chan error
+	chunkSaveErrChanClosed bool
+	lastErr                error
+	collection             string
+	replication            string
 }
 
 func newDirtyPages(file *File) *ContinuousDirtyPages {
-	return &ContinuousDirtyPages{
-		Data: make([]byte, file.wfs.option.ChunkSizeLimit),
-		f:    file,
+	dirtyPages := &ContinuousDirtyPages{
+		intervals:        &ContinuousIntervals{},
+		f:                file,
+		chunkSaveErrChan: make(chan error, runtime.NumCPU()),
 	}
+	go func() {
+		for t := range dirtyPages.chunkSaveErrChan {
+			if t != nil {
+				dirtyPages.lastErr = t
+			}
+		}
+	}()
+	return dirtyPages
 }
 
-func (pages *ContinuousDirtyPages) AddPage(ctx context.Context, offset int64, data []byte) (chunks []*filer_pb.FileChunk, err error) {
+func (pages *ContinuousDirtyPages) AddPage(offset int64, data []byte) {
 
-	pages.lock.Lock()
-	defer pages.lock.Unlock()
+	glog.V(4).Infof("%s AddPage [%d,%d) of %d bytes", pages.f.fullpath(), offset, offset+int64(len(data)), pages.f.entry.Attributes.FileSize)
 
-	var chunk *filer_pb.FileChunk
-
-	if len(data) > len(pages.Data) {
+	if len(data) > int(pages.f.wfs.option.ChunkSizeLimit) {
 		// this is more than what buffer can hold.
-		return pages.flushAndSave(ctx, offset, data)
+		pages.flushAndSave(offset, data)
 	}
 
-	if offset < pages.Offset || offset >= pages.Offset+int64(len(pages.Data)) ||
-		pages.Offset+int64(len(pages.Data)) < offset+int64(len(data)) {
-		// if the data is out of range,
-		// or buffer is full if adding new data,
-		// flush current buffer and add new data
+	pages.intervals.AddInterval(data, offset)
 
-		// println("offset", offset, "size", len(data), "existing offset", pages.Offset, "size", pages.Size)
-
-		if chunk, err = pages.saveExistingPagesToStorage(ctx); err == nil {
-			if chunk != nil {
-				glog.V(4).Infof("%s/%s add save [%d,%d)", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size))
-				chunks = append(chunks, chunk)
-			}
-		} else {
-			glog.V(0).Infof("%s/%s add save [%d,%d): %v", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size), err)
-			return
-		}
-		pages.Offset = offset
-		copy(pages.Data, data)
-		pages.Size = int64(len(data))
-		return
+	if pages.intervals.TotalSize() >= pages.f.wfs.option.ChunkSizeLimit {
+		pages.saveExistingLargestPageToStorage()
 	}
-
-	if offset != pages.Offset+pages.Size {
-		// when this happens, debug shows the data overlapping with existing data is empty
-		// the data is not just append
-		if offset == pages.Offset && int(pages.Size) < len(data) {
-			// glog.V(2).Infof("pages[%d,%d) pages.Data len=%v, data len=%d, pages.Size=%d", pages.Offset, pages.Offset+pages.Size, len(pages.Data), len(data), pages.Size)
-			copy(pages.Data[pages.Size:], data[pages.Size:])
-		} else {
-			if pages.Size != 0 {
-				glog.V(0).Infof("%s/%s add page: pages [%d, %d) write [%d, %d)", pages.f.dir.Path, pages.f.Name, pages.Offset, pages.Offset+pages.Size, offset, offset+int64(len(data)))
-			}
-			return pages.flushAndSave(ctx, offset, data)
-		}
-	} else {
-		copy(pages.Data[offset-pages.Offset:], data)
-	}
-
-	pages.Size = max(pages.Size, offset+int64(len(data))-pages.Offset)
 
 	return
 }
 
-func (pages *ContinuousDirtyPages) flushAndSave(ctx context.Context, offset int64, data []byte) (chunks []*filer_pb.FileChunk, err error) {
-
-	var chunk *filer_pb.FileChunk
+func (pages *ContinuousDirtyPages) flushAndSave(offset int64, data []byte) {
 
 	// flush existing
-	if chunk, err = pages.saveExistingPagesToStorage(ctx); err == nil {
-		if chunk != nil {
-			glog.V(4).Infof("%s/%s flush existing [%d,%d)", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size))
-			chunks = append(chunks, chunk)
-		}
-	} else {
-		glog.V(0).Infof("%s/%s failed to flush1 [%d,%d): %v", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size), err)
-		return
-	}
-	pages.Size = 0
-	pages.Offset = 0
+	pages.saveExistingPagesToStorage()
 
 	// flush the new page
-	if chunk, err = pages.saveToStorage(ctx, data, offset); err == nil {
-		if chunk != nil {
-			glog.V(4).Infof("%s/%s flush big request [%d,%d)", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size))
-			chunks = append(chunks, chunk)
-		}
-	} else {
-		glog.V(0).Infof("%s/%s failed to flush2 [%d,%d): %v", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size), err)
-		return
-	}
+	pages.saveToStorage(bytes.NewReader(data), offset, int64(len(data)))
 
 	return
 }
 
-func (pages *ContinuousDirtyPages) FlushToStorage(ctx context.Context) (chunk *filer_pb.FileChunk, err error) {
-
-	pages.lock.Lock()
-	defer pages.lock.Unlock()
-
-	if pages.Size == 0 {
-		return nil, nil
+func (pages *ContinuousDirtyPages) saveExistingPagesToStorage() {
+	for pages.saveExistingLargestPageToStorage() {
 	}
-
-	if chunk, err = pages.saveExistingPagesToStorage(ctx); err == nil {
-		pages.Size = 0
-		pages.Offset = 0
-		if chunk != nil {
-			glog.V(4).Infof("%s/%s flush [%d,%d)", pages.f.dir.Path, pages.f.Name, chunk.Offset, chunk.Offset+int64(chunk.Size))
-		}
-	}
-	return
 }
 
-func (pages *ContinuousDirtyPages) saveExistingPagesToStorage(ctx context.Context) (*filer_pb.FileChunk, error) {
+func (pages *ContinuousDirtyPages) saveExistingLargestPageToStorage() (hasSavedData bool) {
 
-	if pages.Size == 0 {
-		return nil, nil
+	maxList := pages.intervals.RemoveLargestIntervalLinkedList()
+	if maxList == nil {
+		return false
 	}
 
-	return pages.saveToStorage(ctx, pages.Data[:pages.Size], pages.Offset)
+	fileSize := int64(pages.f.entry.Attributes.FileSize)
+
+	chunkSize := min(maxList.Size(), fileSize-maxList.Offset())
+	if chunkSize == 0 {
+		return false
+	}
+
+	pages.saveToStorage(maxList.ToReader(), maxList.Offset(), chunkSize)
+
+	return true
 }
 
-func (pages *ContinuousDirtyPages) saveToStorage(ctx context.Context, buf []byte, offset int64) (*filer_pb.FileChunk, error) {
+func (pages *ContinuousDirtyPages) saveToStorage(reader io.Reader, offset int64, size int64) {
 
-	var fileId, host string
+	errChanSize := pages.f.wfs.option.ConcurrentWriters
+	if errChanSize == 0 {
+		errChanSize = runtime.NumCPU()
+	}
+	if pages.chunkSaveErrChanClosed {
+		pages.chunkSaveErrChan = make(chan error, errChanSize)
+		pages.chunkSaveErrChanClosed = false
+	}
 
-	if err := pages.f.wfs.withFilerClient(func(client filer_pb.SeaweedFilerClient) error {
+	mtime := time.Now().UnixNano()
+	pages.writeWaitGroup.Add(1)
+	writer := func() {
+		defer pages.writeWaitGroup.Done()
 
-		request := &filer_pb.AssignVolumeRequest{
-			Count:       1,
-			Replication: pages.f.wfs.option.Replication,
-			Collection:  pages.f.wfs.option.Collection,
-			TtlSec:      pages.f.wfs.option.TtlSec,
-			DataCenter:  pages.f.wfs.option.DataCenter,
-		}
-
-		resp, err := client.AssignVolume(ctx, request)
+		reader = io.LimitReader(reader, size)
+		chunk, collection, replication, err := pages.f.wfs.saveDataAsChunk(pages.f.fullpath())(reader, pages.f.Name, offset)
 		if err != nil {
-			glog.V(0).Infof("assign volume failure %v: %v", request, err)
-			return err
+			glog.V(0).Infof("%s saveToStorage [%d,%d): %v", pages.f.fullpath(), offset, offset+size, err)
+			pages.chunkSaveErrChan <- err
+			return
 		}
-
-		fileId, host = resp.FileId, resp.Url
-
-		return nil
-	}); err != nil {
-		return nil, fmt.Errorf("filerGrpcAddress assign volume: %v", err)
+		chunk.Mtime = mtime
+		pages.collection, pages.replication = collection, replication
+		pages.chunkAddLock.Lock()
+		defer pages.chunkAddLock.Unlock()
+		pages.f.addChunks([]*filer_pb.FileChunk{chunk})
+		glog.V(3).Infof("%s saveToStorage [%d,%d)", pages.f.fullpath(), offset, offset+size)
 	}
 
-	fileUrl := fmt.Sprintf("http://%s/%s", host, fileId)
-	bufReader := bytes.NewReader(buf)
-	uploadResult, err := operation.Upload(fileUrl, pages.f.Name, bufReader, false, "application/octet-stream", nil, "")
-	if err != nil {
-		glog.V(0).Infof("upload data %v to %s: %v", pages.f.Name, fileUrl, err)
-		return nil, fmt.Errorf("upload data: %v", err)
+	if pages.f.wfs.concurrentWriters != nil {
+		pages.f.wfs.concurrentWriters.Execute(writer)
+	} else {
+		go writer()
 	}
-	if uploadResult.Error != "" {
-		glog.V(0).Infof("upload failure %v to %s: %v", pages.f.Name, fileUrl, err)
-		return nil, fmt.Errorf("upload result: %v", uploadResult.Error)
-	}
-
-	return &filer_pb.FileChunk{
-		FileId: fileId,
-		Offset: offset,
-		Size:   uint64(len(buf)),
-		Mtime:  time.Now().UnixNano(),
-		ETag:   uploadResult.ETag,
-	}, nil
-
 }
 
 func max(x, y int64) int64 {
@@ -197,4 +135,14 @@ func max(x, y int64) int64 {
 		return x
 	}
 	return y
+}
+func min(x, y int64) int64 {
+	if x < y {
+		return x
+	}
+	return y
+}
+
+func (pages *ContinuousDirtyPages) ReadDirtyDataAt(data []byte, startOffset int64) (maxStop int64) {
+	return pages.intervals.ReadDataAt(data, startOffset)
 }

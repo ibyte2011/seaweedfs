@@ -5,28 +5,27 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/grpc"
+
 	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/chrislusf/seaweedfs/weed/pb"
+	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/master_pb"
 	"github.com/chrislusf/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/chrislusf/seaweedfs/weed/util"
 )
 
-func WithVolumeServerClient(volumeServer string, fn func(volume_server_pb.VolumeServerClient) error) error {
+func WithVolumeServerClient(volumeServer string, grpcDialOption grpc.DialOption, fn func(volume_server_pb.VolumeServerClient) error) error {
 
 	grpcAddress, err := toVolumeServerGrpcAddress(volumeServer)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to parse volume server %v: %v", volumeServer, err)
 	}
 
-	grpcConnection, err := util.GrpcDial(grpcAddress)
-	if err != nil {
-		return fmt.Errorf("fail to dial %s: %v", grpcAddress, err)
-	}
-	defer grpcConnection.Close()
+	return pb.WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+		client := volume_server_pb.NewVolumeServerClient(grpcConnection)
+		return fn(client)
+	}, grpcAddress, grpcDialOption)
 
-	client := volume_server_pb.NewVolumeServerClient(grpcConnection)
-
-	return fn(client)
 }
 
 func toVolumeServerGrpcAddress(volumeServer string) (grpcAddress string, err error) {
@@ -39,15 +38,30 @@ func toVolumeServerGrpcAddress(volumeServer string) (grpcAddress string, err err
 	return fmt.Sprintf("%s:%d", volumeServer[0:sepIndex], port+10000), nil
 }
 
-func withMasterServerClient(masterServer string, fn func(masterClient master_pb.SeaweedClient) error) error {
+func WithMasterServerClient(masterServer string, grpcDialOption grpc.DialOption, fn func(masterClient master_pb.SeaweedClient) error) error {
 
-	grpcConnection, err := util.GrpcDial(masterServer)
-	if err != nil {
-		return fmt.Errorf("fail to dial %s: %v", masterServer, err)
+	masterGrpcAddress, parseErr := pb.ParseServerToGrpcAddress(masterServer)
+	if parseErr != nil {
+		return fmt.Errorf("failed to parse master %v: %v", masterServer, parseErr)
 	}
-	defer grpcConnection.Close()
 
-	client := master_pb.NewSeaweedClient(grpcConnection)
+	return pb.WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+		client := master_pb.NewSeaweedClient(grpcConnection)
+		return fn(client)
+	}, masterGrpcAddress, grpcDialOption)
 
-	return fn(client)
+}
+
+func WithFilerServerClient(filerServer string, grpcDialOption grpc.DialOption, fn func(masterClient filer_pb.SeaweedFilerClient) error) error {
+
+	filerGrpcAddress, parseErr := pb.ParseServerToGrpcAddress(filerServer)
+	if parseErr != nil {
+		return fmt.Errorf("failed to parse filer %v: %v", filerGrpcAddress, parseErr)
+	}
+
+	return pb.WithCachedGrpcClient(func(grpcConnection *grpc.ClientConn) error {
+		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
+		return fn(client)
+	}, filerGrpcAddress, grpcDialOption)
+
 }
