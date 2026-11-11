@@ -1,61 +1,83 @@
 package command
 
 import (
-	"bufio"
 	"fmt"
 	"os"
+	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/shell"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+)
+
+var (
+	shellOptions        shell.ShellOptions
+	shellInitialFiler   *string
+	shellCluster        *string
+	shellDebug          *bool
+	shellConnectTimeout *time.Duration
 )
 
 func init() {
 	cmdShell.Run = runShell // break init cycle
+	shellOptions.Masters = cmdShell.Flag.String("master", "", "comma-separated master servers, e.g. localhost:9333")
+	shellOptions.FilerGroup = cmdShell.Flag.String("filerGroup", "", "filerGroup for the filers")
+	shellInitialFiler = cmdShell.Flag.String("filer", "", "filer host and port for initial connection, e.g. localhost:8888")
+	shellCluster = cmdShell.Flag.String("cluster", "", "cluster defined in shell.toml")
+	shellDebug = cmdShell.Flag.Bool("debug", false, "print informational logs to stderr")
+	shellConnectTimeout = cmdShell.Flag.Duration("connectTimeout", 30*time.Second, "timeout for the initial master connection and filer discovery")
 }
 
 var cmdShell = &Command{
 	UsageLine: "shell",
-	Short:     "run interactive commands, now just echo",
-	Long: `run interactive commands.
+	Short:     "run interactive administrative commands",
+	Long: `run interactive administrative commands.
 
-  `,
+	Generate shell.toml via "weed scaffold -config=shell"
+
+`,
 }
 
-var ()
-
 func runShell(command *Command, args []string) bool {
-	r := bufio.NewReader(os.Stdin)
-	o := bufio.NewWriter(os.Stdout)
-	e := bufio.NewWriter(os.Stderr)
-	prompt := func() {
-		var err error
-		if _, err = o.WriteString("> "); err != nil {
-			glog.V(0).Infoln("error writing to stdout:", err)
-		}
-		if err = o.Flush(); err != nil {
-			glog.V(0).Infoln("error flushing stdout:", err)
-		}
-	}
-	readLine := func() string {
-		ret, err := r.ReadString('\n')
-		if err != nil {
-			fmt.Fprint(e, err)
-			os.Exit(1)
-		}
-		return ret
-	}
-	execCmd := func(cmd string) int {
-		if cmd != "" {
-			if _, err := o.WriteString(cmd); err != nil {
-				glog.V(0).Infoln("error writing to stdout:", err)
-			}
-		}
-		return 0
+
+	util.LoadSecurityConfiguration()
+	shellOptions.GrpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
+	shellOptions.Directory = "/"
+
+	util.LoadConfiguration("shell", false)
+	viper := util.GetViper()
+	cluster := viper.GetString("cluster.default")
+	if *shellCluster != "" {
+		cluster = *shellCluster
 	}
 
-	cmd := ""
-	for {
-		prompt()
-		cmd = readLine()
-		execCmd(cmd)
+	if *shellOptions.Masters == "" {
+		if cluster == "" {
+			*shellOptions.Masters = "localhost:9333"
+		} else {
+			*shellOptions.Masters = viper.GetString("cluster." + cluster + ".master")
+		}
 	}
+
+	filerAddress := *shellInitialFiler
+	if filerAddress == "" && cluster != "" {
+		filerAddress = viper.GetString("cluster." + cluster + ".filer")
+	}
+	shellOptions.FilerAddress = pb.ServerAddress(filerAddress)
+	shellOptions.Debug = *shellDebug
+	shellOptions.ConnectTimeout = *shellConnectTimeout
+	if shellOptions.Debug {
+		fmt.Fprintf(os.Stderr, "master: %s filer: %s\n", *shellOptions.Masters, shellOptions.FilerAddress)
+	}
+
+	if err := shell.RunShell(shellOptions); err != nil {
+		// The command already printed the error; a piped run has to fail the
+		// script wrapping it too.
+		SetCommandExitStatus(1)
+	}
+
+	return true
+
 }

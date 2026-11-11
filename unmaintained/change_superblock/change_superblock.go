@@ -7,8 +7,11 @@ import (
 	"path"
 	"strconv"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 var (
@@ -23,21 +26,23 @@ var (
 This is to change replication factor in .dat file header. Need to shut down the volume servers
 that has those volumes.
 
-1. fix the .dat file in place
-	// just see the replication setting
-	go run change_replication.go -volumeId=9 -dir=/Users/chrislu/Downloads
-		Current Volume Replication: 000
-	// fix the replication setting
-	go run change_replication.go -volumeId=9 -dir=/Users/chrislu/Downloads -replication 001
-		Current Volume Replication: 000
-		Changing to: 001
-		Done.
+ 1. fix the .dat file in place
+    // just see the replication setting
+    go run change_replication.go -volumeId=9 -dir=/Users/chrislu/Downloads
+    Current Volume Replication: 000
+    // fix the replication setting
+    go run change_replication.go -volumeId=9 -dir=/Users/chrislu/Downloads -replication 001
+    Current Volume Replication: 000
+    Changing to: 001
+    Done.
 
 2. copy the fixed .dat and related .idx files to some remote server
 3. restart volume servers or start new volume servers.
 */
 func main() {
 	flag.Parse()
+	util_http.NewGlobalHttpClient()
+
 	fileName := strconv.Itoa(*fixVolumeId)
 	if *fixVolumeCollection != "" {
 		fileName = *fixVolumeCollection + "_" + fileName
@@ -46,9 +51,10 @@ func main() {
 	if err != nil {
 		glog.Fatalf("Open Volume Data File [ERROR]: %v", err)
 	}
-	defer datFile.Close()
+	datBackend := backend.NewDiskFile(datFile)
+	defer datBackend.Close()
 
-	superBlock, err := storage.ReadSuperBlock(datFile)
+	superBlock, err := super_block.ReadSuperBlock(datBackend)
 
 	if err != nil {
 		glog.Fatalf("cannot parse existing super block: %v", err)
@@ -60,7 +66,7 @@ func main() {
 	hasChange := false
 
 	if *targetReplica != "" {
-		replica, err := storage.NewReplicaPlacementFromString(*targetReplica)
+		replica, err := super_block.NewReplicaPlacementFromString(*targetReplica)
 
 		if err != nil {
 			glog.Fatalf("cannot parse target replica %s: %v", *targetReplica, err)
@@ -73,7 +79,7 @@ func main() {
 	}
 
 	if *targetTTL != "" {
-		ttl, err := storage.ReadTTL(*targetTTL)
+		ttl, err := needle.ReadTTL(*targetTTL)
 
 		if err != nil {
 			glog.Fatalf("cannot parse target ttl %s: %v", *targetTTL, err)
@@ -89,7 +95,7 @@ func main() {
 
 		header := superBlock.Bytes()
 
-		if n, e := datFile.WriteAt(header, 0); n == 0 || e != nil {
+		if n, e := datBackend.WriteAt(header, 0); n == 0 || e != nil {
 			glog.Fatalf("cannot write super block: %v", e)
 		}
 

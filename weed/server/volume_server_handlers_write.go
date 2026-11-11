@@ -1,6 +1,10 @@
 package weed_server
 
 import (
+	"bytes"
+	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -8,58 +12,141 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/operation"
-	"github.com/chrislusf/seaweedfs/weed/storage"
-	"github.com/chrislusf/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 )
 
+var jpegStart = []byte{0xFF, 0xD8, 0xFF}
+
+// replicaContentMd5 drops the client's digest once the orientation fix has
+// rewritten the JPEG: replicas check it against the bytes they are sent.
+func (vs *VolumeServer) replicaContentMd5(n *needle.Needle, contentMd5 string) string {
+	if !vs.FixJpgOrientation || contentMd5 == "" || !bytes.HasPrefix(n.Data, jpegStart) {
+		return contentMd5
+	}
+	if sum := md5.Sum(n.Data); base64.StdEncoding.EncodeToString(sum[:]) != contentMd5 {
+		return ""
+	}
+	return contentMd5
+}
+
 func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if e := r.ParseForm(); e != nil {
-		glog.V(0).Infoln("form parse error:", e)
+		glog.V(0).InfolnCtx(ctx, "form parse error:", e)
 		writeJsonError(w, r, http.StatusBadRequest, e)
 		return
 	}
-	vid, _, _, _, _ := parseURLPath(r.URL.Path)
-	volumeId, ve := storage.NewVolumeId(vid)
+
+	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
+	volumeId, ve := needle.NewVolumeId(vid)
 	if ve != nil {
-		glog.V(0).Infoln("NewVolumeId error:", ve)
+		glog.V(0).InfolnCtx(ctx, "NewVolumeId error:", ve)
+		stats.VolumeServerFileWriteFailures.Inc()
 		writeJsonError(w, r, http.StatusBadRequest, ve)
 		return
 	}
-	needle, ne := storage.NewNeedle(r, vs.FixJpgOrientation)
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid, true) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
+
+	bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+	defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
+
+	reqNeedle, originalSize, contentMd5, ne := needle.CreateNeedleFromRequest(r, vs.FixJpgOrientation, vs.fileSizeLimitBytes, bytesBuffer)
 	if ne != nil {
+		stats.VolumeServerFileWriteFailures.Inc()
 		writeJsonError(w, r, http.StatusBadRequest, ne)
 		return
 	}
 
 	ret := operation.UploadResult{}
-	size, errorStatus := topology.ReplicatedWrite(vs.GetMaster(),
-		vs.store, volumeId, needle, r)
+	// use context.WithoutCancel to avoid context cancellation when the client connection is closed
+	isUnchanged, writeError := topology.ReplicatedWrite(context.WithoutCancel(ctx), vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, vs.replicaContentMd5(reqNeedle, contentMd5))
+	if writeError != nil {
+		stats.VolumeServerFileWriteFailures.Inc()
+		status := http.StatusInternalServerError
+		if errors.Is(writeError, storage.ErrorReadOnly) {
+			status = http.StatusConflict
+		}
+		if errors.Is(writeError, topology.ErrorWriteRefused) {
+			w.Header().Set("X-Seaweed-Write-Outcome", "refused-before-append")
+		}
+		writeJsonError(w, r, status, writeError)
+		return
+	}
+
+	// http 204 status code does not allow body
+	if writeError == nil && isUnchanged {
+		SetEtag(w, reqNeedle.Etag())
+		w.Header().Set("Content-MD5", contentMd5)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	httpStatus := http.StatusCreated
-	if errorStatus != "" {
-		httpStatus = http.StatusInternalServerError
-		ret.Error = errorStatus
+	if reqNeedle.HasName() {
+		ret.Name = string(reqNeedle.Name)
 	}
-	if needle.HasName() {
-		ret.Name = string(needle.Name)
-	}
-	ret.Size = size
-	setEtag(w, needle.Etag())
+	ret.Size = uint32(originalSize)
+	ret.ETag = reqNeedle.Etag()
+	ret.Mime = string(reqNeedle.Mime)
+	ret.ContentMd5 = contentMd5
+	SetEtag(w, ret.ETag)
+	w.Header().Set("Content-MD5", contentMd5)
 	writeJsonQuiet(w, r, httpStatus, ret)
 }
 
 func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
-	n := new(storage.Needle)
+	n := new(needle.Needle)
 	vid, fid, _, _, _ := parseURLPath(r.URL.Path)
-	volumeId, _ := storage.NewVolumeId(vid)
-	n.ParsePath(fid)
+	volumeId, _ := needle.NewVolumeId(vid)
+	if err := n.ParsePath(fid); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	if !vs.maybeCheckJwtAuthorization(r, vid, fid, true) {
+		writeJsonError(w, r, http.StatusUnauthorized, errors.New("wrong jwt"))
+		return
+	}
 
 	// glog.V(2).Infof("volume %s deleting %s", vid, n)
 
 	cookie := n.Cookie
 
-	_, ok := vs.store.ReadVolumeNeedle(volumeId, n)
+	ecVolume, hasEcVolume := vs.store.FindEcVolume(volumeId)
+
+	if hasEcVolume {
+		count, err := vs.store.DeleteEcShardNeedle(ecVolume, n, cookie)
+		if errors.Is(err, storage.ErrorDeleted) {
+			// Already gone. The non-EC path below answers 404 from its
+			// ReadVolumeNeedle pre-check rather than counting a write failure,
+			// and callers fold that 404 into success.
+			m := make(map[string]uint32)
+			m["size"] = 0
+			writeJsonQuiet(w, r, http.StatusNotFound, m)
+			return
+		}
+		writeDeleteResult(err, count, w, r)
+		return
+	}
+
+	_, ok := vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
+	if ok != nil && r.FormValue("type") == "replicate" {
+		// the write this delete undoes can still be queued here
+		if v := vs.store.GetVolume(volumeId); v != nil {
+			v.CancelPendingWrites(n.Id, cookie)
+			_, ok = vs.store.ReadVolumeNeedle(volumeId, n, deleteReadOption(), nil)
+		}
+	}
 	if ok != nil {
 		m := make(map[string]uint32)
 		m["size"] = 0
@@ -76,13 +163,15 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 	count := int64(n.Size)
 
 	if n.IsChunkedManifest() {
-		chunkManifest, e := operation.LoadChunkManifest(n.Data, n.IsGzipped())
+		chunkManifest, e := operation.LoadChunkManifest(n.Data, n.IsCompressed())
 		if e != nil {
+			stats.VolumeServerFileWriteFailures.Inc()
 			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Load chunks manifest error: %v", e))
 			return
 		}
 		// make sure all chunks had deleted before delete manifest
-		if e := chunkManifest.DeleteChunks(vs.GetMaster()); e != nil {
+		if e := chunkManifest.DeleteChunks(vs.GetMaster, false, vs.grpcDialOption); e != nil {
+			stats.VolumeServerFileWriteFailures.Inc()
 			writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Delete chunks error: %v", e))
 			return
 		}
@@ -97,19 +186,35 @@ func (vs *VolumeServer) DeleteHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := topology.ReplicatedDelete(vs.GetMaster(), vs.store, volumeId, n, r)
+	_, err := topology.ReplicatedDelete(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, n, r)
 
+	writeDeleteResult(err, count, w, r)
+
+}
+
+// deleteReadOption returns the read option used by deletes: read only the
+// needle's header and trailer.
+//
+// A delete needs to know that the needle exists, what its cookie is, and
+// whether it is a chunk manifest. None of that requires the payload. If the
+// needle turns out to be a chunk manifest, the read loads its data as well,
+// because the delete needs the manifest to delete the chunks.
+func deleteReadOption() *storage.ReadOption {
+	return &storage.ReadOption{AttemptMetaOnly: true, MustMetaOnly: true}
+}
+
+func writeDeleteResult(err error, count int64, w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		m := make(map[string]int64)
 		m["size"] = count
 		writeJsonQuiet(w, r, http.StatusAccepted, m)
 	} else {
-		writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Deletion Failed: %v", err))
+		stats.VolumeServerFileWriteFailures.Inc()
+		writeJsonError(w, r, http.StatusInternalServerError, fmt.Errorf("Deletion Failed: %w", err))
 	}
-
 }
 
-func setEtag(w http.ResponseWriter, etag string) {
+func SetEtag(w http.ResponseWriter, etag string) {
 	if etag != "" {
 		if strings.HasPrefix(etag, "\"") {
 			w.Header().Set("ETag", etag)

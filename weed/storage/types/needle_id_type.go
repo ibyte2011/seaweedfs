@@ -1,11 +1,10 @@
-// +build !128BitNeedleId
-
 package types
 
 import (
 	"fmt"
-	"github.com/chrislusf/seaweedfs/weed/util"
 	"strconv"
+
+	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 type NeedleId uint64
@@ -34,6 +33,15 @@ func BytesToNeedleId(bytes []byte) NeedleId {
 
 func (k NeedleId) String() string {
 	return strconv.FormatUint(uint64(k), 16)
+}
+
+func (k NeedleId) FileId(volumeId uint32) string {
+	// pad to even length so strict hex fid parsers accept it
+	needleIdHex := k.String()
+	if len(needleIdHex)%2 == 1 {
+		needleIdHex = "0" + needleIdHex
+	}
+	return fmt.Sprintf("%d,%s00000000", volumeId, needleIdHex)
 }
 
 func ParseNeedleId(idString string) (NeedleId, error) {
